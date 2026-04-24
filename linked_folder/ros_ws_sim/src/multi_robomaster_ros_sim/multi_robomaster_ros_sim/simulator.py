@@ -9,7 +9,6 @@ import matplotlib
 matplotlib.use('Qt5Agg')
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
-import math
 
 class MultiRoboMasterSim(Node):
     def __init__(self):
@@ -20,25 +19,17 @@ class MultiRoboMasterSim(Node):
         self.ROBOT_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         self.N = len(self.ROBOT_IDS)
         # time
-        self.TIMEOUT_SET_MOBILE_BASE_SPEED = 20 # milliseconds (RobotHardware frequency set to 20Hz)
-        self.TIMEOUT_GET_POSES = 10 # milliseconds (Vicon frequency set to 100Hz)
+        self.TIMEOUT_SET_MOBILE_BASE_SPEED = 20 # milliseconds
+        self.TIMEOUT_GET_POSES = 10 # milliseconds
         self.TIMEOUT_CHASSIS_SPEED = 500 # milliseconds
         self.DT = (self.TIMEOUT_SET_MOBILE_BASE_SPEED + self.TIMEOUT_GET_POSES) / 1000.
         # robot control
         self.MAX_LINEAR_SPEED = 1.0 # meters / second
         self.MAX_ANGULAR_SPEED = 360 * np.pi / 180 # radians / second
-        # self.SAFETY_LAYER = safety_layer
-        # self.GAMMA = 10.
-        # self.P = np.eye(2 * self.N)
         # dimensions
         self.ENV = [-2., -2., 4., 4.] # (x, y) can vary from (ENV[0], ENV[1]) to (ENV[0]+ENV[2], ENV[1]+ENV[3])
         self.ROBOT_SIZE = [0.24, 0.32] # [w, l]
-        # if safety_radius is None:
-        #     self.SAFETY_RADIUS = max(self.ROBOT_SIZE) * 2.2
-        # else:
-        #     self.SAFETY_RADIUS = safety_radius
         self.GRIPPER_SIZE = 0.1
-        self.INIT_POSES_THRESH = 0.5
         
         # State: [x, y, theta]
         self.states = {}
@@ -94,7 +85,7 @@ class MultiRoboMasterSim(Node):
         self.axes.add_patch(p_env)
 
         for i, rid in enumerate(self.ROBOT_IDS):
-            R = np.array([[math.cos(self.states[rid][2]), -math.sin(self.states[rid][2])], [math.sin(self.states[rid][2]), math.cos(self.states[rid][2])]])
+            R = np.array([[cos(self.states[rid][2]), -sin(self.states[rid][2])], [sin(self.states[rid][2]), cos(self.states[rid][2])]])
             t = np.array([self.states[rid][0], self.states[rid][1]])
             p_robot = patches.Polygon(t + (np.array([[self.ROBOT_SIZE[1] / 2.0, self.ROBOT_SIZE[0] / 2.0],
                                                      [-self.ROBOT_SIZE[1] / 2.0, self.ROBOT_SIZE[0] / 2.0],
@@ -129,7 +120,7 @@ class MultiRoboMasterSim(Node):
     
     def __update_plot(self):
         for rid in self.ROBOT_IDS:
-            R = np.array([[math.cos(self.states[rid][2]), -math.sin(self.states[rid][2])], [math.sin(self.states[rid][2]), math.cos(self.states[rid][2])]])
+            R = np.array([[cos(self.states[rid][2]), -sin(self.states[rid][2])], [sin(self.states[rid][2]), cos(self.states[rid][2])]])
             t = np.array([self.states[rid][0], self.states[rid][1]])
             xy_robot = t + (np.array([[self.ROBOT_SIZE[1] / 2.0, self.ROBOT_SIZE[0] / 2.0],
                                       [-self.ROBOT_SIZE[1] / 2.0, self.ROBOT_SIZE[0] / 2.0],
@@ -190,13 +181,15 @@ class MultiRoboMasterSim(Node):
             else:
                 v_cmd = self.velocities[rid]
                 
-            # 1. Simple Kinematic Update (Integrate velocity)
-            # Global X/Y update (controller sends global velocities)
+            # Integrate velocity
+            # Global X/Y update
+            # The controller sends local velocities, which is what the robots are expected to receive.
+            # These are then converted to global in the velocity callback in the simulator
             self.states[rid][0] += v_cmd[0] * self.DT
             self.states[rid][1] += v_cmd[1] * self.DT
             self.states[rid][2] += v_cmd[2] * self.DT
 
-            # 2. Create PoseStamped message
+            # Create PoseStamped message
             msg = PoseStamped()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.header.frame_id = 'world'
