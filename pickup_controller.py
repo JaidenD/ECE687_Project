@@ -159,7 +159,7 @@ class PickupController(Node):
 
         # execute the following sequence of events with 1 second delays between each
         # open gripper -> lower arm -> drive to location of stick 
-        # -> approach stick -> close gripper -> lift arm -> rotate (eventually will be the position of robot 2)
+        # -> approach stick -> close gripper -> lift arm -> rotate to face robot 2
         if self.state == 'open_gripper':
             if self.just_entered_state:
                 self.just_entered_state = False
