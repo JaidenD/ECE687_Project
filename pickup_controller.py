@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
 from rclpy.action import ActionClient
@@ -9,20 +10,27 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from robomaster_msgs.action import GripperControl, MoveArm
 from std_msgs.msg import ColorRGBA
 
-import numpy as np
 
-
-ROBOT_ID = 1
+FIRST_ROBOT_ID = 1
 SECOND_ROBOT_ID = 2
 
+# TEMPORARY: replace these with the stick mocap topic in the lab
 STICK_X = 0.50
 STICK_Y = 0.50
-
 STICK_THETA = 0.0          # Direction the robot should face when grabbing.
+
+# TEMPORARY: replace these with the puck mocap topic in the lab
+PUCK_X = 0.80
+PUCK_Y = 0.50
 
 APPROACH_DISTANCE = 0.35   # Stop this far behind the stick first.
 TOOL_OFFSET = 0.25         # Robot center to gripper/stick contact point.
+STICK_LENGTH = 1.0         # TODO: tune in lab
 
+WIND_UP_ANGLE = np.pi / 8
+FOLLOW_THROUGH_ANGLE = 2 * np.pi / 8
+
+# Keep these false in sim. Turn them true in lab only after manually testing the actions.
 USE_ARM_ACTIONS = False
 USE_GRIPPER_ACTIONS = False
 
@@ -41,9 +49,6 @@ MAX_ANGULAR_SPEED = 1.2
 POSITION_TOLERANCE = 0.05
 HEADING_TOLERANCE = 0.12
 
-# TEMPORARY
-ROBOT2_X = -0.5
-ROBOT2_Y = -0.5
 
 # Keep angle in [-pi, pi] range
 def wrap(angle):
@@ -57,7 +62,7 @@ class PickupController(Node):
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=1)
         self.pose_sub = self.create_subscription(
             PoseStamped,
-            f'/vrpn_mocap/dji_robot_{ROBOT_ID}/pose',
+            f'/vrpn_mocap/dji_robot_{FIRST_ROBOT_ID}/pose',
             self.save_pose,
             qos,
         )
@@ -67,21 +72,23 @@ class PickupController(Node):
             self.save_robot2_pose,
             qos,
         )
-        self.cmd_pub = self.create_publisher(Twist, f'/robot{ROBOT_ID}/cmd_vel', qos)
+        self.cmd_pub = self.create_publisher(Twist, f'/robot{FIRST_ROBOT_ID}/cmd_vel', qos)
         self.robot2_cmd_pub = self.create_publisher(Twist, f'/robot{SECOND_ROBOT_ID}/cmd_vel', qos)
-        self.led_pub = self.create_publisher(ColorRGBA, f'/robot{ROBOT_ID}/leds/color', qos)
+        self.led_pub = self.create_publisher(ColorRGBA, f'/robot{FIRST_ROBOT_ID}/leds/color', qos)
 
         self.gripper_client = ActionClient(
-            self, GripperControl, f'/robot{ROBOT_ID}/gripper')
+            self, GripperControl, f'/robot{FIRST_ROBOT_ID}/gripper')
         self.arm_client = ActionClient(
-            self, MoveArm, f'/robot{ROBOT_ID}/move_arm')
+            self, MoveArm, f'/robot{FIRST_ROBOT_ID}/move_arm')
 
         self.pose = None
         self.robot2_pose = None
-        self.state = 'position_scoring_robot'
+        self.state = 'open_gripper' # set initial state
         self.state_started = self.get_clock().now()
         self.just_entered_state = True
         self.waiting_for_pose_logged = False
+        self.wind_angle = None
+        self.follow_through_angle = None
 
         approach_x = math.cos(STICK_THETA)
         approach_y = math.sin(STICK_THETA)
@@ -92,9 +99,9 @@ class PickupController(Node):
         self.timer = self.create_timer(0.05, self.control_step)
 
         self.get_logger().info(
-            f'Pickup demo started for robot {ROBOT_ID}. '
+            f'Pickup demo started for robot {FIRST_ROBOT_ID}. '
             f'Stick=({STICK_X:.2f}, {STICK_Y:.2f}, {STICK_THETA:.2f}), '
-            f'second_robot_pose=/vrpn_mocap/dji_robot_{SECOND_ROBOT_ID}/pose'
+            f'Puck=({PUCK_X:.2f}, {PUCK_Y:.2f})'
         )
 
     def save_pose(self, msg):
@@ -114,16 +121,14 @@ class PickupController(Node):
         return dt.nanoseconds / 1e9
 
     def control_step(self):
-        if self.pose is None or self.robot2_pose is None:
+        if self.pose is None:
             if not self.waiting_for_pose_logged:
                 self.waiting_for_pose_logged = True
-                self.get_logger().info('Waiting for robot 1 and robot 2 mocap poses...')
+                self.get_logger().info('Waiting for robot 1 mocap pose...')
             return
 
         x = self.pose.pose.position.x
         y = self.pose.pose.position.y
-        robot2_x = self.robot2_pose.pose.position.x
-        robot2_y = self.robot2_pose.pose.position.y
 
         # formula 2 from
         # https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation?utm_source=chatgpt.com#Comparison_with_other_representations_of_rotations
@@ -135,31 +140,13 @@ class PickupController(Node):
         1.0 - 2.0 * (q.y * q.y + q.z * q.z),
         )
 
-        q2 = self.robot2_pose.pose.orientation
-        theta2 = math.atan2(
-        2.0 * (q2.w * q2.z + q2.x * q2.y),
-        1.0 - 2.0 * (q2.y * q2.y + q2.z * q2.z),
-        )
-
-
         ##########################################
         #           Command sequence             #
         ##########################################
 
-        if self.state == 'position_scoring_robot':
-            cmd, error = self.point_command(robot2_x, robot2_y, theta2, ROBOT2_X, ROBOT2_Y)
-            self.cmd_pub.publish(Twist())
-            self.robot2_cmd_pub.publish(cmd)
-
-            if error < POSITION_TOLERANCE:
-                self.cmd_pub.publish(Twist())
-                self.robot2_cmd_pub.publish(Twist())
-                self.go_to_state('open_gripper')
-            return
-
-        # execute the following sequence of events with 1 second delays between each
-        # open gripper -> lower arm -> drive to location of stick 
-        # -> approach stick -> close gripper -> lift arm -> rotate to face robot 2
+        # execute the following sequence of events with short delays between each
+        # open gripper -> lower arm -> drive to location of stick
+        # -> approach stick -> close gripper -> lift arm -> face puck -> wind up -> strike
         if self.state == 'open_gripper':
             if self.just_entered_state:
                 self.just_entered_state = False
@@ -231,17 +218,47 @@ class PickupController(Node):
                 self.send_arm(ARM_CARRY_X, ARM_CARRY_Z)
 
             if self.seconds_in_state() > 1.5:
-                self.go_to_state('face_second_robot')
+                self.go_to_state('face_puck')
 
             self.cmd_pub.publish(Twist())
             return
 
-        if self.state == 'face_second_robot':
-            robot2_direction = math.atan2(robot2_y - y, robot2_x - x)
-            cmd = self.heading_command(theta, robot2_direction)
+        # TODO: replace PUCK_X/PUCK_Y with mocap.
+        # No navigation to the puck here; this assumes we are already in striking range.
+        if self.state == 'face_puck':
+            puck_direction = math.atan2(PUCK_Y - y, PUCK_X - x)
+            cmd = self.heading_command(theta, puck_direction)
             self.cmd_pub.publish(cmd)
 
-            if abs(wrap(robot2_direction - theta)) < HEADING_TOLERANCE:
+            if abs(wrap(puck_direction - theta)) < HEADING_TOLERANCE:
+                self.cmd_pub.publish(Twist())
+                self.go_to_state('wind_up_strike')
+            return
+
+        if self.state == 'wind_up_strike':
+            if self.just_entered_state:
+                self.just_entered_state = False
+                # Save the target once. Do not recompute it every control loop.
+                self.wind_angle = theta - WIND_UP_ANGLE # this sign will change depending on what side the pass is being done from
+
+            cmd = self.heading_command(theta, self.wind_angle)
+            self.cmd_pub.publish(cmd)
+
+            if abs(wrap(self.wind_angle - theta)) < HEADING_TOLERANCE:
+                self.cmd_pub.publish(Twist())
+                self.go_to_state('strike_puck')
+            return
+
+        if self.state == 'strike_puck':
+            if self.just_entered_state:
+                self.just_entered_state = False
+                # Save the follow-through target once so the robot actually finishes the swing.
+                self.follow_through_angle = self.wind_angle + FOLLOW_THROUGH_ANGLE # same here
+
+            cmd = self.heading_command(theta, self.follow_through_angle, Kp=15) # gains should be more aggressive for a hard swing
+            self.cmd_pub.publish(cmd)
+
+            if abs(wrap(self.follow_through_angle - theta)) < HEADING_TOLERANCE:
                 self.cmd_pub.publish(Twist())
                 self.go_to_state('done')
             return
@@ -256,7 +273,7 @@ class PickupController(Node):
 
         error_x = target_x - tool_x
         error_y = target_y - tool_y
-        error = math.hypot(error_x, error_y) # euclidean length of error vector
+        error = math.sqrt(error_x**2 + error_y**2) # euclidean length of error vector
 
         desired_tool_vx = KP_POSITION * error_x
         desired_tool_vy = KP_POSITION * error_y
@@ -289,11 +306,11 @@ class PickupController(Node):
         cmd.angular.z = 0.0
         return cmd, error
 
-    # Change angle robot is facing 
-    def heading_command(self, theta, target_theta):
+    # Change angle robot is facing
+    def heading_command(self, theta, target_theta, Kp=KP_HEADING):
         cmd = Twist()
         error = wrap(target_theta - theta)
-        cmd.angular.z = np.clip(KP_HEADING * error, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED)
+        cmd.angular.z = np.clip(Kp * error, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED)
         return cmd
 
     def send_gripper(self, target_state):
