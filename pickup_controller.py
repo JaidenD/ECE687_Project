@@ -11,8 +11,8 @@ from robomaster_msgs.action import GripperControl, MoveArm
 from std_msgs.msg import ColorRGBA
 
 
-FIRST_ROBOT_ID = 1
-SECOND_ROBOT_ID = 2
+FIRST_ROBOT_ID = 5
+# SECOND_ROBOT_ID = 2
 
 # TEMPORARY: replace these with the stick mocap topic in the lab
 STICK_X = 0.50
@@ -30,9 +30,8 @@ STICK_LENGTH = 1.0         # TODO: tune in lab
 WIND_UP_ANGLE = np.pi / 8
 FOLLOW_THROUGH_ANGLE = 2 * np.pi / 8
 
-# Keep these false in sim. Turn them true in lab only after manually testing the actions.
-USE_ARM_ACTIONS = False
-USE_GRIPPER_ACTIONS = False
+USE_ARM_ACTIONS = True
+USE_GRIPPER_ACTIONS = True
 
 # These arm values need tuning on the real robot.
 ARM_PICKUP_X = 0.10
@@ -66,14 +65,16 @@ class PickupController(Node):
             self.save_pose,
             qos,
         )
+        """
         self.robot2_pose_sub = self.create_subscription(
             PoseStamped,
             f'/vrpn_mocap/dji_robot_{SECOND_ROBOT_ID}/pose',
             self.save_robot2_pose,
             qos,
         )
+        """
         self.cmd_pub = self.create_publisher(Twist, f'/robot{FIRST_ROBOT_ID}/cmd_vel', qos)
-        self.robot2_cmd_pub = self.create_publisher(Twist, f'/robot{SECOND_ROBOT_ID}/cmd_vel', qos)
+        # self.robot2_cmd_pub = self.create_publisher(Twist, f'/robot{SECOND_ROBOT_ID}/cmd_vel', qos)
         self.led_pub = self.create_publisher(ColorRGBA, f'/robot{FIRST_ROBOT_ID}/leds/color', qos)
 
         self.gripper_client = ActionClient(
@@ -154,16 +155,16 @@ class PickupController(Node):
                 self.send_gripper(GripperControl.Goal.OPEN)
 
             if self.seconds_in_state() > 1.0:
-                self.go_to_state('lower_arm')
+                self.go_to_state('lift_arm')
 
             # set linear and angular velocity to zero (check if this makes a diff in lab)
             self.cmd_pub.publish(Twist())
             return
 
-        if self.state == 'lower_arm':
+        if self.state == 'lift_arm':
             if self.just_entered_state:
                 self.just_entered_state = False
-                self.send_arm(ARM_PICKUP_X, ARM_PICKUP_Z)
+                self.send_arm(ARM_CARRY_X, ARM_CARRY_Z)
 
             if self.seconds_in_state() > 1.5:
                 self.go_to_state('drive_to_pregrasp')
@@ -171,6 +172,7 @@ class PickupController(Node):
             self.cmd_pub.publish(Twist())
             return
 
+        # TODO: get correct location
         if self.state == 'drive_to_pregrasp':
             cmd, error = self.tool_point_command(x, y, theta, self.pregrasp_x, self.pregrasp_y)
             self.cmd_pub.publish(cmd)
@@ -207,12 +209,13 @@ class PickupController(Node):
                 self.set_led(0.0, 1.0, 0.0)
 
             if self.seconds_in_state() > 1.0:
-                self.go_to_state('lift_arm')
+                self.go_to_state('lift_arm_again')
 
             self.cmd_pub.publish(Twist())
             return
 
-        if self.state == 'lift_arm':
+        # Lift arm to clear remove stick from slot
+        if self.state == 'lift_arm_again':
             if self.just_entered_state:
                 self.just_entered_state = False
                 self.send_arm(ARM_CARRY_X, ARM_CARRY_Z)
@@ -235,10 +238,11 @@ class PickupController(Node):
                 self.go_to_state('wind_up_strike')
             return
 
+        #TODO: Some drive to puck procedure
+
         if self.state == 'wind_up_strike':
             if self.just_entered_state:
                 self.just_entered_state = False
-                # Save the target once. Do not recompute it every control loop.
                 self.wind_angle = theta - WIND_UP_ANGLE # this sign will change depending on what side the pass is being done from
 
             cmd = self.heading_command(theta, self.wind_angle)
@@ -252,7 +256,6 @@ class PickupController(Node):
         if self.state == 'strike_puck':
             if self.just_entered_state:
                 self.just_entered_state = False
-                # Save the follow-through target once so the robot actually finishes the swing.
                 self.follow_through_angle = self.wind_angle + FOLLOW_THROUGH_ANGLE # same here
 
             cmd = self.heading_command(theta, self.follow_through_angle, Kp=15) # gains should be more aggressive for a hard swing
@@ -361,7 +364,7 @@ def main(args=None):
     finally:
         if rclpy.ok():
             node.cmd_pub.publish(Twist())
-            node.robot2_cmd_pub.publish(Twist())
+            # node.robot2_cmd_pub.publish(Twist())
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
