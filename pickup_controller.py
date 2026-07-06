@@ -11,15 +11,20 @@ from robomaster_msgs.action import GripperControl, MoveArm
 from std_msgs.msg import ColorRGBA
 
 
-FIRST_ROBOT_ID = 5
-# SECOND_ROBOT_ID = 2
+FIRST_ROBOT_ID = 2
+SECOND_ROBOT_ID = 9
 
-# TEMPORARY: replace these with the stick mocap topic in the lab
+# If these topic names are set, the controller will use live mocap values.
+# Leave them as empty strings to use the manual constants below.
+STICK_MOCAP_TOPIC = '/vrpn_mocap/hockey_sticks_1/pose'
+PUCK_MOCAP_TOPIC = ''      # '/vrpn_mocap/puck/pose'
+
+# Manual fallback values. Used when the mocap topic strings above are empty.
 STICK_X = 0.50
 STICK_Y = 0.50
 STICK_THETA = 0.0          # Direction the robot should face when grabbing.
 
-# TEMPORARY: replace these with the puck mocap topic in the lab
+# Manual fallback values. Used when PUCK_MOCAP_TOPIC is empty.
 PUCK_X = 0.80
 PUCK_Y = 0.50
 
@@ -40,13 +45,17 @@ ARM_CARRY_X = 0.00
 ARM_CARRY_Z = 0.08
 
 # Gains
-KP_POSITION = 1.4
-KP_HEADING = 1.8
+KP_POSITION = 0.25
+KP_HEADING = 0.3
 
 MAX_LINEAR_SPEED = 0.35
 MAX_ANGULAR_SPEED = 1.2
+
+PREGRASP_TOLERANCE = 0.10
 POSITION_TOLERANCE = 0.05
 HEADING_TOLERANCE = 0.12
+DEBUG_PRINT_PERIOD = 1.0
+MOCAP_PRINT_PERIOD = 1.0
 
 
 # Keep angle in [-pi, pi] range
@@ -54,28 +63,56 @@ def wrap(angle):
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
+def yaw_from_pose(msg):
+    q = msg.pose.orientation
+    return math.atan2(
+        2.0 * (q.w * q.z + q.x * q.y),
+        1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+    )
+
+
 class PickupController(Node):
     def __init__(self):
         super().__init__('pickup_controller') # Create ROS node
 
-        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=1)
+        mocap_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=1)
+
+        # see if this makes the robot drive
+        command_qos = QoSProfile(depth=10)
+
         self.pose_sub = self.create_subscription(
             PoseStamped,
             f'/vrpn_mocap/dji_robot_{FIRST_ROBOT_ID}/pose',
             self.save_pose,
-            qos,
+            mocap_qos,
         )
-        """
+
+        if STICK_MOCAP_TOPIC:
+            self.stick_pose_sub = self.create_subscription(
+                PoseStamped,
+                STICK_MOCAP_TOPIC,
+                self.save_stick_pose,
+                mocap_qos,
+            )
+
+        if PUCK_MOCAP_TOPIC:
+            self.puck_pose_sub = self.create_subscription(
+                PoseStamped,
+                PUCK_MOCAP_TOPIC,
+                self.save_puck_pose,
+                mocap_qos,
+            )
+
         self.robot2_pose_sub = self.create_subscription(
             PoseStamped,
             f'/vrpn_mocap/dji_robot_{SECOND_ROBOT_ID}/pose',
             self.save_robot2_pose,
-            qos,
+            mocap_qos,
         )
-        """
-        self.cmd_pub = self.create_publisher(Twist, f'/robot{FIRST_ROBOT_ID}/cmd_vel', qos)
-        # self.robot2_cmd_pub = self.create_publisher(Twist, f'/robot{SECOND_ROBOT_ID}/cmd_vel', qos)
-        self.led_pub = self.create_publisher(ColorRGBA, f'/robot{FIRST_ROBOT_ID}/leds/color', qos)
+
+        self.cmd_pub = self.create_publisher(Twist, f'/robot{FIRST_ROBOT_ID}/cmd_vel', command_qos)
+        # self.robot2_cmd_pub = self.create_publisher(Twist, f'/robot{SECOND_ROBOT_ID}/cmd_vel', command_qos)
+        self.led_pub = self.create_publisher(ColorRGBA, f'/robot{FIRST_ROBOT_ID}/leds/color', command_qos)
 
         self.gripper_client = ActionClient(
             self, GripperControl, f'/robot{FIRST_ROBOT_ID}/gripper')
@@ -84,17 +121,16 @@ class PickupController(Node):
 
         self.pose = None
         self.robot2_pose = None
+        self.stick_pose = None
+        self.puck_pose = None
         self.state = 'open_gripper' # set initial state
         self.state_started = self.get_clock().now()
         self.just_entered_state = True
         self.waiting_for_pose_logged = False
         self.wind_angle = None
         self.follow_through_angle = None
-
-        approach_x = math.cos(STICK_THETA)
-        approach_y = math.sin(STICK_THETA)
-        self.pregrasp_x = STICK_X - APPROACH_DISTANCE * approach_x
-        self.pregrasp_y = STICK_Y - APPROACH_DISTANCE * approach_y
+        self.next_debug_print = 0.0
+        self.next_mocap_print = 0.0
 
         self.set_led(0.0, 0.2, 1.0)
         self.timer = self.create_timer(0.05, self.control_step)
@@ -104,6 +140,10 @@ class PickupController(Node):
             f'Stick=({STICK_X:.2f}, {STICK_Y:.2f}, {STICK_THETA:.2f}), '
             f'Puck=({PUCK_X:.2f}, {PUCK_Y:.2f})'
         )
+        if STICK_MOCAP_TOPIC:
+            self.get_logger().info(f'Using live stick mocap from {STICK_MOCAP_TOPIC}')
+        if PUCK_MOCAP_TOPIC:
+            self.get_logger().info(f'Using live puck mocap from {PUCK_MOCAP_TOPIC}')
 
     def save_pose(self, msg):
         self.pose = msg
@@ -111,10 +151,17 @@ class PickupController(Node):
     def save_robot2_pose(self, msg):
         self.robot2_pose = msg
 
+    def save_stick_pose(self, msg):
+        self.stick_pose = msg
+
+    def save_puck_pose(self, msg):
+        self.puck_pose = msg
+
     def go_to_state(self, new_state):
         self.state = new_state
         self.state_started = self.get_clock().now()
         self.just_entered_state = True
+        self.next_debug_print = 0.0
         self.get_logger().info(f'State: {new_state}')
 
     def seconds_in_state(self):
@@ -131,15 +178,39 @@ class PickupController(Node):
         x = self.pose.pose.position.x
         y = self.pose.pose.position.y
 
-        # formula 2 from
-        # https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation?utm_source=chatgpt.com#Comparison_with_other_representations_of_rotations
-        # We want to find the rotation angle about the z-axis of the robot.
-        # R11 = cos(theta), R21 = sin(theta), so theta = atan2(R21, R11).
-        q = self.pose.pose.orientation
-        theta = math.atan2(
-        2.0 * (q.w * q.z + q.x * q.y),
-        1.0 - 2.0 * (q.y * q.y + q.z * q.z),
-        )
+        theta = yaw_from_pose(self.pose)
+
+        stick_x = STICK_X
+        stick_y = STICK_Y
+        stick_theta = STICK_THETA
+        if self.stick_pose is not None:
+            stick_x = self.stick_pose.pose.position.x
+            stick_y = self.stick_pose.pose.position.y
+            stick_theta = yaw_from_pose(self.stick_pose)
+
+        puck_x = PUCK_X
+        puck_y = PUCK_Y
+        if self.puck_pose is not None:
+            puck_x = self.puck_pose.pose.position.x
+            puck_y = self.puck_pose.pose.position.y
+
+        approach_x = math.cos(stick_theta)
+        approach_y = math.sin(stick_theta)
+        pregrasp_x = stick_x # - APPROACH_DISTANCE * approach_x
+        pregrasp_y = stick_y # - APPROACH_DISTANCE * approach_y
+
+        # Debug: print the raw mocap coordinates so we can verify the
+        # robot is being tracked and the controller is using the right frame.
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now >= self.next_mocap_print:
+            self.next_mocap_print = now + MOCAP_PRINT_PERIOD
+            self.get_logger().info(
+                'mocap: '
+                f'robot={FIRST_ROBOT_ID}, '
+                f'state={self.state}, '
+                f'x={x:.3f}, y={y:.3f}, z={self.pose.pose.position.z:.3f}, '
+                f'theta={theta:.3f}'
+            )
 
         ##########################################
         #           Command sequence             #
@@ -174,28 +245,52 @@ class PickupController(Node):
 
         # TODO: get correct location
         if self.state == 'drive_to_pregrasp':
-            cmd, error = self.tool_point_command(x, y, theta, self.pregrasp_x, self.pregrasp_y)
+            cmd, error = self.tool_point_command(x, y, theta, pregrasp_x, pregrasp_y)
             self.cmd_pub.publish(cmd)
 
-            if error < POSITION_TOLERANCE:
+            # if this state gets stuck, check whether these numbers
+            # match the actual mocap frame and robot topic.
+            if self.seconds_in_state() >= self.next_debug_print:
+                self.next_debug_print += DEBUG_PRINT_PERIOD
+                self.get_logger().info(
+                    'drive_to_pregrasp: '
+                    f'pose=({x:.2f}, {y:.2f}, {theta:.2f}), '
+                    f'target=({pregrasp_x:.2f}, {pregrasp_y:.2f}), '
+                    f'stick=({stick_x:.2f}, {stick_y:.2f}, {stick_theta:.2f}), '
+                    f'error={error:.2f}, '
+                    f'cmd=(x={cmd.linear.x:.2f}, yaw={cmd.angular.z:.2f})'
+                )
+
+            if error < PREGRASP_TOLERANCE:
                 self.cmd_pub.publish(Twist())
                 self.go_to_state('face_stick')
             return
 
         if self.state == 'face_stick':
-            cmd = self.heading_command(theta, STICK_THETA)
+            cmd = self.heading_command(theta, stick_theta)
             self.cmd_pub.publish(cmd)
 
-            if abs(wrap(STICK_THETA - theta)) < HEADING_TOLERANCE:
+            if abs(wrap(stick_theta - theta)) < HEADING_TOLERANCE:
                 self.cmd_pub.publish(Twist())
                 self.go_to_state('approach_stick')
             return
 
         if self.state == 'approach_stick':
-            cmd, error = self.tool_point_command(x, y, theta, STICK_X, STICK_Y)
+            cmd, error = self.tool_point_command(x, y, theta, stick_x, stick_y)
             cmd.linear.x = np.clip(cmd.linear.x, -0.18, 0.18)
             cmd.angular.z = np.clip(cmd.angular.z, -0.7, 0.7)
             self.cmd_pub.publish(cmd)
+
+            # Lab debug: this should shrink as the gripper approaches the stick.
+            if self.seconds_in_state() >= self.next_debug_print:
+                self.next_debug_print += DEBUG_PRINT_PERIOD
+                self.get_logger().info(
+                    'approach_stick: '
+                    f'pose=({x:.2f}, {y:.2f}, {theta:.2f}), '
+                    f'target=({stick_x:.2f}, {stick_y:.2f}), '
+                    f'error={error:.2f}, '
+                    f'cmd=(x={cmd.linear.x:.2f}, yaw={cmd.angular.z:.2f})'
+                )
 
             if error < POSITION_TOLERANCE:
                 self.cmd_pub.publish(Twist())
@@ -226,10 +321,10 @@ class PickupController(Node):
             self.cmd_pub.publish(Twist())
             return
 
-        # TODO: replace PUCK_X/PUCK_Y with mocap.
         # No navigation to the puck here; this assumes we are already in striking range.
+        # If PUCK_MOCAP_TOPIC is set, puck_x/puck_y come from live mocap.
         if self.state == 'face_puck':
-            puck_direction = math.atan2(PUCK_Y - y, PUCK_X - x)
+            puck_direction = math.atan2(puck_y - y, puck_x - x)
             cmd = self.heading_command(theta, puck_direction)
             self.cmd_pub.publish(cmd)
 
@@ -324,6 +419,7 @@ class PickupController(Node):
         if not self.gripper_client.wait_for_server(timeout_sec=0.2):
             self.get_logger().warning('No gripper action server found')
             return
+
 
         goal = GripperControl.Goal()
         goal.target_state = target_state
