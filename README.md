@@ -12,21 +12,34 @@ From the folder `multi_robomaster_ros_sim`, run:
 
 This opens two Terminal windows:
 
-1. The simulator window, which runs the noise simulator through `./run.sh`.
+1. The simulator window, which runs the project simulator through `./run.sh`.
 2. The controller window, which waits for the simulator, builds
-   `robo_hockey_controller`, and runs `controller.py`.
+   `robo_hockey_controller`, sets simulator mode, and runs both robot controllers.
 
-The noise simulator starts two robots at random poses and publishes fake mocap
+The simulator starts two robots at random poses and publishes fake mocap
 topics at `/vrpn_mocap/dji_robot_1/pose` and
 `/vrpn_mocap/dji_robot_2/pose`. It already includes noise in the simulated
-robot motion and the fake mocap messages.
+robot motion and the fake mocap messages. It also publishes the same holder,
+puck, and goal mocap topics used by `controller.py`.
 
-The orange dot and dashed line show the stick point used by the controller:
-`x + STICK_DIST cos(theta), y + STICK_DIST sin(theta)`. To change that overlay,
-change `STICK_DIST` in `controller.py` and rerun the simulator.
+The orange dot and dashed line show the virtual point used by approximate
+linearization. The brown holder contains separate stick slots for robots 1 and
+2. Once a simulated pickup finishes, the corresponding stick is drawn attached
+to that robot. The purple circle shows the live receiving point computed from
+robot 2's pose.
 
-The brown, blue, and green markers show the fixed sim stick, puck, and goal
-positions defined near the top of `controller.py`.
+The holder, puck, goal, slot offsets, arm poses, and impact model values are
+defined in clearly marked sections near the top of `config.py`.
+
+Long-range navigation uses a CLF-CBF quadratic program on the approximate-
+linearization lookahead point. The CLF drives that point to its target, while
+one hard CBF constraint keeps it outside each dashed red obstacle boundary.
+The QP uses the `quadprog` backend already installed with `qpsolvers` in the
+project Docker image. If the solver fails or reports infeasibility, the
+controller publishes a zero `Twist` instead of reusing an old command.
+
+The exact controller and simulator from before the QP changes are preserved in
+`multi_robomaster_ros_sim/pre_qp_backup`.
 
 To stop the controller, press:
 
@@ -70,6 +83,7 @@ Build and run the controller:
 cd /linked_folder/ros_ws_sim
 colcon build --packages-select robo_hockey_controller
 source install/setup.bash
+export ROBO_HOCKEY_SIM=1
 
 ros2 run robo_hockey_controller controller
 ```
@@ -80,8 +94,14 @@ To exit:
 Ctrl + C
 ```
 
-To reset the simulator state, stop the simulator with `Ctrl+C` and run
-`./run.sh` again.
+To reset both the simulator and controller state from a third terminal inside
+the simulator container:
+
+```bash
+source /opt/ros/humble/setup.bash
+source /linked_folder/ros_ws_sim/install/setup.bash
+ros2 topic pub /sim/reset std_msgs/msg/Empty "{}" --once
+```
 
 ---
 
@@ -171,9 +191,13 @@ ros2 topic pub /robot5/cmd_vel geometry_msgs/msg/Twist \
 "{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}" --once
 ```
 
+Before using the physical robots, measure every value in the highlighted
+`lab calibration values` section at the top of `config.py`.
+
 Build the controller inside the container.
 
-> **Note:** Change the robot ID value in the controller script before running.
+> **Note:** Change both robot IDs and the measured calibration values in
+> `config.py` before running.
 > If `/linked_folder/ros_ws_sim` does not exist, the container was started
 > without the `-v ...:/linked_folder:rw` mount above.
 
@@ -181,6 +205,7 @@ Build the controller inside the container.
 cd /linked_folder/ros_ws_sim
 colcon build --packages-select robo_hockey_controller
 source install/setup.bash
+export ROBO_HOCKEY_SIM=0
 
 ros2 run robo_hockey_controller controller
 ```
