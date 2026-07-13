@@ -9,7 +9,8 @@ from robo_hockey_controller.config import (
     ARM_PLAY_X,
     ARM_PLAY_Z,
     BASE_TO_GRIPPER,
-    HOLDER_INSERT_HEADING_OFFSET,
+    HOLDER_PLATFORM_RADIUS,
+    NAVIGATION_ENVELOPE_RADIUS,
     NAV_LOOKAHEAD_DIST,
     NAV_POINT_TOL,
     PICKUP_ALIGNMENT_DISTANCE,
@@ -69,7 +70,9 @@ class PickupStateHandlers:
         )
 
         # pickup_direction points from the robot toward the slot.
-        pickup_theta = wrap(holder_theta + HOLDER_INSERT_HEADING_OFFSET)
+        # The holder frame's positive x-axis points out of the front. The robot
+        # starts on that side and faces back along negative x toward the slot.
+        pickup_theta = wrap(holder_theta + np.pi)
         pickup_direction = np.array([
             np.cos(pickup_theta),
             np.sin(pickup_theta),
@@ -143,12 +146,33 @@ class PickupStateHandlers:
             pickup['alignment']
             + NAV_LOOKAHEAD_DIST * pickup['direction']
         )
+
+        # The CBF cannot drive to a target inside its own holder safety circle.
+        # Detect a bad combination of pickup distances before commanding motion.
+        holder_position = np.array([
+            self.holder_pose.pose.position.x,
+            self.holder_pose.pose.position.y,
+        ])
+        target_clearance = np.linalg.norm(target_point - holder_position)
+        required_clearance = (
+            HOLDER_PLATFORM_RADIUS + NAVIGATION_ENVELOPE_RADIUS
+        )
+        if target_clearance <= required_clearance:
+            self.get_logger().error(
+                'Pickup target is inside the holder safety envelope: '
+                f'target_clearance={target_clearance:.2f} m, '
+                f'required_clearance={required_clearance:.2f} m'
+            )
+            self.stop_and_go_to_state('error')
+            return
+
         cmd, point_error, qp_result = self.safe_navigation_controller(
             x,
             y,
             theta,
             target_point,
             include_other_robot=False,
+            include_holder=True,
         )
         self.publish_motion(
             'pickup navigation',

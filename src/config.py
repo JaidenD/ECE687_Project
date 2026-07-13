@@ -5,32 +5,43 @@ import numpy as np
 # lab calibration values - measure these before running on the robots
 ########################################################################
 
-ROBOT1_ID = 1  # passing robot id
-ROBOT2_ID = 2  # scoring robot id
+ROBOT1_ID = 5  # passing robot id (live driver and mocap name: dji_robot_8)
+ROBOT2_ID = 3  # scoring robot id
 
-HOLDER_MOCAP_TOPIC = '/vrpn_mocap/stick/pose'
-PUCK_MOCAP_TOPIC = '/vrpn_mocap/puck/pose'
+HOLDER_MOCAP_TOPIC = '/vrpn_mocap/hockey_sticks_1/pose'
+PUCK_MOCAP_TOPIC = '/vrpn_mocap/hockey_puck_green/pose'
 GOAL_MOCAP_TOPIC = '/vrpn_mocap/goal/pose'
+
+# Vector from each mocap rigid-body origin to the robot's rotation center,
+# written in the robot body frame as [forward, left]. Robot 9 was estimated
+# from the July 13 in-place rotation data. Robot 1 still needs calibration.
+ROBOT_MOCAP_TO_BASE_OFFSET_BODY = {
+    ROBOT1_ID: np.array([0.137, 0.059]),
+    ROBOT2_ID: np.array([0.0, 0.0]),  # TODO: estimate with an in-place rotation
+}
 
 # the two sticks are fixed side by side in the holder frame
 STICK_SLOT_FORWARD_OFFSET = 0.0  # TODO: measure in the lab
-STICK_SLOT_SEPARATION = 0.30     # TODO: measure in the lab
+STICK_SLOT_SEPARATION = 0.0     # TODO: measure in the lab
 STICK_SLOT_OFFSETS = {
     ROBOT1_ID: np.array([
         STICK_SLOT_FORWARD_OFFSET,
-        -STICK_SLOT_SEPARATION / 2.0,
+        0,
     ]),
     ROBOT2_ID: np.array([
         STICK_SLOT_FORWARD_OFFSET,
-        STICK_SLOT_SEPARATION / 2.0,
+        0.15,
     ]),
 }
 
-# zero means the robots approach along the holder's positive x-axis
-HOLDER_INSERT_HEADING_OFFSET = 0.0  # TODO: verify the holder mocap frame
-BASE_TO_GRIPPER = 0.42              # TODO: base mocap origin to grasp point
+# The holder mocap frame's positive x-axis points toward the front approach
+# side. The robot therefore faces along the holder's negative x-axis to insert.
+BASE_TO_GRIPPER = 0.35              # TODO: base mocap origin to grasp point
 PICKUP_INSERT_DISTANCE = 0.18       # straight insertion distance
 PICKUP_ALIGNMENT_DISTANCE = 0.45    # rotate this far before the pregrasp point
+# Circular approximation used by the CBF while navigating to the holder.
+# Measure half of the holder platform's diagonal and replace this value.
+HOLDER_PLATFORM_RADIUS = 0.1
 PICKUP_RETREAT_DISTANCES = {
     ROBOT1_ID: 1.20,  # robot 1 clears the shared pickup area before robot 2 starts
     ROBOT2_ID: 0.45,
@@ -38,9 +49,9 @@ PICKUP_RETREAT_DISTANCES = {
 
 # MoveArm uses absolute x/z coordinates in meters relative to arm_base_link
 ARM_PICKUP_X = 0.18         # TODO: measure the arm pose at the stick handle
-ARM_PICKUP_Z = -0.02        # TODO: measure the arm pose at the stick handle
+ARM_PICKUP_Z = 0.2        # TODO: measure the arm pose at the stick handle
 ARM_LIFT_X = ARM_PICKUP_X
-ARM_LIFT_Z = 0.12           # TODO: high enough to clear the foam slot
+ARM_LIFT_Z = 0.25           # TODO: high enough to clear the foam slot
 ARM_PLAY_X = 0.18           # TODO: arm extension while playing hockey
 ARM_PLAY_Z = -0.04          # TODO: stick height at the puck
 ARM_CARRY_X = ARM_PLAY_X
@@ -100,7 +111,7 @@ SIM_OBSTACLES = (
 )
 
 SIM_ARM_ACTION_TIME = 0.40
-SIM_GRIPPER_ACTION_TIME = 0.30
+SIM_GRIPPER_ACTION_TIME = 1.0
 
 
 ########################################################################
@@ -116,13 +127,15 @@ DEBUG_PRINT_PERIOD = 0.20
 NAV_LOOKAHEAD_DIST = 0.25  # distance from base origin to controlled point
 NAV_KP = 0.80
 NAV_POINT_TOL = 0.08
-MAX_LINEAR_SPEED = 0.35
-MAX_ANGULAR_SPEED = 1.40
+# Conservative hardware limits. The first lab run showed the QP alternating
+# between +/-1.40 rad/s while also commanding 0.35 m/s.
+MAX_LINEAR_SPEED = 0.15
+MAX_ANGULAR_SPEED = 0.50
 CLF_GAIN = 1.00          # requested convergence rate
 CBF_GAIN = 0.50          # how early the barrier slows inward motion
 QP_SLACK_PENALTY = 1000.0  # high cost makes CLF relaxation a last resort
 QP_SOLVER = 'quadprog'
-NAVIGATION_ENVELOPE_RADIUS = 0.45
+NAVIGATION_ENVELOPE_RADIUS = 0.0
 OTHER_ROBOT_SAFETY_DISTANCE = 0.70
 
 # slow pickup controllers
@@ -130,6 +143,9 @@ HEADING_KP = 1.50
 CROSS_TRACK_KP = 1.50
 STRAIGHT_KP = 1.00
 PICKUP_HEADING_TOL = 0.08
+# Do not drive forward toward a point when the robot is more than about
+# 20 degrees off course. It first rotates in place to avoid circling the point.
+POINT_DRIVE_HEADING_LIMIT = 0.35
 PICKUP_POSITION_TOL = 0.04
 PICKUP_LATERAL_TOL = 0.05
 PICKUP_APPROACH_SPEED = 0.12
@@ -156,4 +172,5 @@ PUCK_STOP_SPEED_TOL = 0.10
 PUCK_STOP_HOLD_TIME = 0.40
 AUTO_RUN_SCORING_SWING = True
 
-ACTION_SERVER_TIMEOUT = 0.50
+# ROS action discovery can take a few seconds on the shared lab network.
+ACTION_SERVER_TIMEOUT = 5.00

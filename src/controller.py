@@ -25,6 +25,7 @@ from robo_hockey_controller.config import (
     GOAL_MOCAP_TOPIC,
     HEADING_KP,
     HOLDER_MOCAP_TOPIC,
+    HOLDER_PLATFORM_RADIUS,
     LAB_OBSTACLES,
     MAX_ANGULAR_SPEED,
     MAX_LINEAR_SPEED,
@@ -33,6 +34,7 @@ from robo_hockey_controller.config import (
     NAV_KP,
     NAV_LOOKAHEAD_DIST,
     OTHER_ROBOT_SAFETY_DISTANCE,
+    POINT_DRIVE_HEADING_LIMIT,
     PICKUP_MAX_ANGULAR_SPEED,
     POSE_FILTER_ALPHA,
     PUCK_MOCAP_TOPIC,
@@ -41,12 +43,18 @@ from robo_hockey_controller.config import (
     QP_SOLVER,
     ROBOT1_ID,
     ROBOT2_ID,
+    ROBOT_MOCAP_TO_BASE_OFFSET_BODY,
     SIM_ARM_ACTION_TIME,
     SIM_GRIPPER_ACTION_TIME,
     SIM_OBSTACLES,
     STRAIGHT_KP,
 )
-from robo_hockey_controller.helpers import navigation_point, wrap, yaw_from_pose
+from robo_hockey_controller.helpers import (
+    navigation_point,
+    rotate_2d,
+    wrap,
+    yaw_from_pose,
+)
 from robo_hockey_controller.hockey_states import HockeyStateHandlers
 from robo_hockey_controller.navigation_qp import solve_navigation_qp
 from robo_hockey_controller.pickup_states import PickupStateHandlers
@@ -131,6 +139,13 @@ class Controller(PickupStateHandlers, HockeyStateHandlers, Node):
             durability=DurabilityPolicy.VOLATILE,
             depth=1,
         )
+        # The physical RoboMaster driver requests reliable velocity commands.
+        # A reliable publisher also remains compatible with the simulator.
+        command_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            depth=1,
+        )
 
         ########################################################################
         # subscriptions
@@ -187,7 +202,7 @@ class Controller(PickupStateHandlers, HockeyStateHandlers, Node):
         self.cmd_pub = self.create_publisher(
             Twist,
             f'/robot{self.robot_id}/cmd_vel',
-            pose_qos,
+            command_qos,
         )
         self.state_pub = self.create_publisher(
             String,
@@ -250,12 +265,17 @@ class Controller(PickupStateHandlers, HockeyStateHandlers, Node):
 
     def save_robot_pose(self, msg):
         """Save the filtered robot pose and its local receipt time."""
-        self.robot_pose = self.low_pass_pose(self.robot_pose, msg)
+        base_pose = self.robot_base_pose_from_mocap(msg, self.robot_id)
+        self.robot_pose = self.low_pass_pose(self.robot_pose, base_pose)
         self.robot_pose_time = self.now_seconds()
 
     def save_other_robot_pose(self, msg):
         """Save the filtered pose of the other robot."""
-        self.other_robot_pose = self.low_pass_pose(self.other_robot_pose, msg)
+        base_pose = self.robot_base_pose_from_mocap(msg, self.other_robot_id)
+        self.other_robot_pose = self.low_pass_pose(
+            self.other_robot_pose,
+            base_pose,
+        )
         self.other_robot_pose_time = self.now_seconds()
 
     def save_holder_pose(self, msg):
@@ -330,6 +350,28 @@ class Controller(PickupStateHandlers, HockeyStateHandlers, Node):
     ########################################################################
     # end ROS subscription callbacks
     ########################################################################
+
+    def robot_base_pose_from_mocap(self, mocap_pose, robot_id):
+        """Convert the off-center mocap marker position to the base center."""
+        # Simulator poses already describe the center of the robot body.
+        if self.sim:
+            return mocap_pose
+
+        theta = yaw_from_pose(mocap_pose)
+        offset_body = ROBOT_MOCAP_TO_BASE_OFFSET_BODY[robot_id]
+        offset_world = rotate_2d(offset_body, theta)
+
+        base_pose = PoseStamped()
+        base_pose.header = mocap_pose.header
+        base_pose.pose.position.x = (
+            mocap_pose.pose.position.x + offset_world[0]
+        )
+        base_pose.pose.position.y = (
+            mocap_pose.pose.position.y + offset_world[1]
+        )
+        base_pose.pose.position.z = mocap_pose.pose.position.z
+        base_pose.pose.orientation = mocap_pose.pose.orientation
+        return base_pose
 
     def low_pass_pose(self, old_pose, new_pose):
         """Apply a first-order low-pass filter to one mocap pose."""
@@ -429,7 +471,7 @@ class Controller(PickupStateHandlers, HockeyStateHandlers, Node):
     ########################################################################
     # Start of safe navigation functions
     ########################################################################
-    def navigation_obstacles(self, include_other_robot):
+    def navigation_obstacles(self, include_other_robot, include_holder=False):
         """Return static obstacle centers and their required clearances."""
         centers = []
         safety_distances = []
@@ -440,6 +482,20 @@ class Controller(PickupStateHandlers, HockeyStateHandlers, Node):
             # the radius assigned to the robot/stick navigation envelope.
             safe_distance = obstacle['radius'] + NAVIGATION_ENVELOPE_RADIUS
             safety_distances.append(safe_distance)
+
+        if include_holder:
+            # The holder position comes from mocap, so it cannot be entered in
+            # LAB_OBSTACLES as a fixed world coordinate. Treat its rectangular
+            # platform as a conservative circle during the long approach. The
+            # later straight pickup states intentionally do not use this CBF.
+            holder_center = np.array([
+                self.holder_pose.pose.position.x,
+                self.holder_pose.pose.position.y,
+            ])
+            centers.append(holder_center)
+            safety_distances.append(
+                HOLDER_PLATFORM_RADIUS + NAVIGATION_ENVELOPE_RADIUS
+            )
 
         if include_other_robot:
             other_x = self.other_robot_pose.pose.position.x
@@ -463,6 +519,7 @@ class Controller(PickupStateHandlers, HockeyStateHandlers, Node):
         theta,
         point_desired,
         include_other_robot,
+        include_holder=False,
     ):
         # The nominal controller points directly at the goal. The QP changes
         # this velocity only when needed for the CLF, CBFs, or speed limits.
@@ -471,7 +528,10 @@ class Controller(PickupStateHandlers, HockeyStateHandlers, Node):
         point_error = np.linalg.norm(point_error_vector)
         nominal_velocity = NAV_KP * point_error_vector
         
-        centers, safety_distances = self.navigation_obstacles(include_other_robot)
+        centers, safety_distances = self.navigation_obstacles(
+            include_other_robot,
+            include_holder,
+        )
 
         try:
             result = solve_navigation_qp(
@@ -566,9 +626,12 @@ class Controller(PickupStateHandlers, HockeyStateHandlers, Node):
         # Use full speed outside 0.25 m and ramp linearly to zero near the goal.
         speed_scale = min(1.0, distance / 0.25)
 
-        # cos(error) slows translation while turning. At 90 degrees or more,
-        # translation is zero and the robot rotates before moving forward.
-        forward_scale = max(0.0, np.cos(heading_error))
+        # A large heading error means forward motion would make the robot drive
+        # in a circle around the point. Rotate in place until it faces the point.
+        if abs(heading_error) > POINT_DRIVE_HEADING_LIMIT:
+            forward_scale = 0.0
+        else:
+            forward_scale = np.cos(heading_error)
 
         cmd = Twist()
         cmd.linear.x = float(max_linear_speed * speed_scale * forward_scale)
@@ -652,7 +715,7 @@ class Controller(PickupStateHandlers, HockeyStateHandlers, Node):
 
         goal = GripperControl.Goal()
         goal.target_state = target_state
-        goal.power = 0.5
+        goal.power = 1.0
 
         self.gripper_goal_future = (
             self.gripper_action_client.send_goal_async(goal)
@@ -768,7 +831,11 @@ class Controller(PickupStateHandlers, HockeyStateHandlers, Node):
         # External shutdown can invalidate ROS before finally runs, in which
         # case publishing is no longer possible.
         if rclpy.ok():
-            self.cmd_pub.publish(Twist())
+            try:
+                self.cmd_pub.publish(Twist())
+            except rclpy._rclpy_pybind11.RCLError:
+                # Ctrl+C can request publisher destruction just before cleanup.
+                pass
 
     def stop_and_go_to_state(self, new_state):
         self.stop()
