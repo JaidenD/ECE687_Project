@@ -1,0 +1,10 @@
+# Goal
+bool execute_swing
+---
+# Result
+bool success
+string message
+---
+# Feedback
+string current_state
+float32 progress
