@@ -43,6 +43,8 @@ from multi_robomaster_ros_sim.config import (
     STICK_PUCK_RESTITUTION,
     STICK_SLOT_OFFSETS,
     STICK_TIP_FROM_BASE,
+    GOAL_WIDTH,
+    GOAL_HEIGHT
 )
 from multi_robomaster_ros_sim.helpers import rotate_2d
 
@@ -725,11 +727,11 @@ class MultiRoboMasterSim(Node):
             ha='center',
         )
 
-        goal_width = 0.70
+        # goal_width = 0.70
         goal_patch = patches.Rectangle(
-            (SIM_GOAL_X - goal_width / 2.0, SIM_GOAL_Y - 0.04),
-            goal_width,
-            0.08,
+            (SIM_GOAL_X - GOAL_WIDTH / 2.0, SIM_GOAL_Y - 0.04),
+            GOAL_WIDTH,
+            GOAL_HEIGHT,
             facecolor='none',
             edgecolor='tab:green',
             linewidth=3.0,
