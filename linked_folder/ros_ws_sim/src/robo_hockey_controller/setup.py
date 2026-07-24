@@ -26,8 +26,6 @@ setup(
     entry_points={
             'console_scripts': [
                 'controller = robo_hockey_controller.controller:main',
-                'hockey_swing_server = robo_hockey_controller.hockey_swing_server:main',
-                'hockey_swing_client = robo_hockey_controller.hockey_swing_client:main'
             ],
         },
 )
